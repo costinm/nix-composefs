@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "composefs-rs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1788778180,
+        "narHash": "sha256-/WkBM0XOYS5M43zVysmsvnxd2u5upAxnE6zTSh2s8N4=",
+        "owner": "containers",
+        "repo": "composefs-rs",
+        "rev": "f720d6c79ac6b082fb1e182eed3b291f88e2a7f4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "containers",
+        "ref": "v0.9.2",
+        "repo": "composefs-rs",
+        "type": "github"
+      }
+    },
     "crane": {
       "locked": {
         "lastModified": 1788465171,
@@ -51,6 +68,7 @@
     },
     "root": {
       "inputs": {
+        "composefs-rs": "composefs-rs",
         "crane": "crane",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",

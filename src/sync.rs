@@ -2,8 +2,7 @@
 //!
 //! Transport is deliberately not built in: `missing` prints the relative
 //! CAS object paths that a worker needs, and any byte transport (SSH+tar,
-//! rsync, OCI, ...) can move them. `bin/nixc-sync.sh` provides the SSH
-//! workflow. After objects arrive, `import` (re-)enables fs-verity, and
+//! rsync, OCI, ...) can move them. After objects arrive, `import` (re-)enables fs-verity, and
 //! `materialize` re-creates /nix/store by hard-linking store entries into
 //! the CAS.
 

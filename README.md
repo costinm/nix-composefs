@@ -2,16 +2,23 @@
 
 `/nix/store` as a **signed, syncable composefs store**.
 
-Build machine: walk a *completion* (a NixOS-style closure — a list of store
-paths), content-address every regular file into a fs-verity object store
-(CAS), emit a composefs **metadata EROFS image** plus a **manifest**, and
-sign the image with the same conventions as initos erofs images.
+This is a rust CLI that turns a /nix/store subset into a 
+syncable composefs store and fs-verity and public key signed 
+Erofs metadata image. 
 
-Worker: verify the signed image, pull only the missing CAS objects over
-SSH, and re-create `/nix/store` by **hard-linking** store entries into the
-CAS. The same CAS serves any number of closures — identical content is
-stored once (dedup like `nix store optimise`, but keyed by fs-verity
+Trusted build machine: find all dependencies (NixOS closure), content-address every regular file into a fs-verity object store
+(composefs CAS), emit a composefs **metadata EROFS image** plus a **manifest**, and
+sign the image with the same conventions as initos erofs images.
+The input is a list of packages (`nix-store -q --refclosure`).
+
+
+Worker: pull the missing CAS objects and erofs, verify signature and re-create `/nix/store` by **hard-linking** store entries into the CAS. The same CAS serves any number of closures — identical content is stored once (dedup like `nix store optimise`, but keyed by fs-verity
 digest instead of re-hashing).
+
+The nix store files will have fs-verity enabled, so any change is detected at runtime. The directories are verified by the 
+erofs fs-verity has which is signed by the builder private key.
+
+Assuming secure EFI boot, signed kernel and init and full chain - after a reboot the file integrity should be verified. An attacker getting access can still break the system - but after reboot changes will be detected.
 
 Built on [composefs-rs](https://github.com/containers/composefs-rs)
 (`composefs` 0.9.x): the scanner, the V1 (C-compatible) EROFS writer, and
@@ -30,27 +37,30 @@ src/manifest.rs    completion manifest (JSON): paths, inventory, objects
 src/sync.rs        missing / import / materialize / optimise
 src/sign.rs        Ed25519 + UEFI db signing & verification (initos layout)
 src/main.rs        CLI
-bin/nixc-sync.sh   SSH transfer helper (tar + scp + remote verify/materialize)
 tests/             end-to-end build->materialize->compare + sign roundtrip
 ```
 
 ## Build (everything from Nix)
 
 ```sh
-nix build .#nix-composefs          # hermetic: rust-overlay, vendored openssl
-nix build .#deps                   # runtime tools (erofs-utils, fsverity-utils, ...)
+nix build .#nix-composefs          # bundle: nix-composefs + upstream cfsctl + runtime tools (musl)
+nix build .#cfsctl                 # upstream composefs-rs cfsctl alone
+nix build .#deps                   # runtime tools only (erofs-utils, fsverity-utils, ...)
 ```
 
 Iterative development (Nix profile under `target/`, host untouched):
 
 ```sh
 . ./env.sh                        # refreshes target/nix/profiles/profile, exports PATH
-ncp-build                         # cargo build --release (state in target/cargo)
+ncp-build                         # cargo build --release --target x86_64-unknown-linux-musl (state in target/cargo)
 ncp-test
-ncp build --help
+ncp build --help                  # runs target/cargo/x86_64-unknown-linux-musl/release/nix-composefs
 ```
 
-Local cargo runs need the vendored-openssl build tools; if not in `PATH`:
+`nix-composefs` and `cfsctl` are statically linked with musl (initos
+conventions); the deps/runtime tools stay glibc.
+
+Local cargo runs need the musl cc and the vendored-openssl build tools; get them via `nix develop`, or install gnumake/perl directly:
 
 ```sh
 nix shell nixpkgs#gnumake nixpkgs#perl --command cargo test
@@ -75,13 +85,6 @@ nix-composefs sign --image system.composefs --secrets /path/to/uefi-keys
 ```
 
 Worker:
-
-```sh
-bin/nixc-sync.sh root@worker --cas /z/img/composefs/objects \
-    --image system.composefs --manifest system.json --secrets /path/to/uefi-keys
-```
-
-or manually:
 
 ```sh
 nix-composefs missing   --manifest system.json --cas $CAS        # one rel. path per line
@@ -142,3 +145,9 @@ nix-composefs optimise --manifest system.json --cas $CAS --store /nix/store
 - GC of the CAS: keep an immutable generation per closure set and only
   collect objects no installed closure references (see initos firmware GC
   policy in `notes/ai/2026-09-08-composefs-git-firmware-rollout.md`).
+
+# TODO
+
+- use the previous version to compute the missing objects to be transmitted or packaged. The same idea used in initos for OCI, we can have a periodic large binary (monthly) and incremental deltas - the worker can be simpler and may not need to track
+nix packages or run a daemon. So instead of rsync-like (find what worker has, send what is missing) keep track here of what 
+the worker is supposed to have, send changed.
