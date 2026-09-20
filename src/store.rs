@@ -6,7 +6,7 @@
 //! `nix-store -q --refclosure <path>` or a NixOS system closure.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -14,7 +14,7 @@ use anyhow::{bail, ensure, Context, Result};
 /// A parsed Nix store entry: `<hash>-<name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StorePath {
-    /// 32-char lowercase hex content hash.
+    /// 32-char Nix32 store hash.
     pub hash: String,
     /// Entry name without the `<hash>-` prefix.
     pub name: String,
@@ -34,15 +34,23 @@ impl StorePath {
         let (hash, name) = entry
             .split_once('-')
             .ok_or_else(|| anyhow::anyhow!("not a store path: {input:?}"))?;
-        if hash.len() != 32 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Nix store hashes use its custom base32 alphabet, not hexadecimal.
+        // See <https://nix.dev/manual/nix/stable/protocols/nix32.html>.
+        if hash.len() != 32
+            || !hash
+                .chars()
+                .all(|c| matches!(c, '0'..='9' | 'a'..='d' | 'f'..='n' | 'p'..='s' | 'v'..='z'))
+        {
             bail!("invalid store hash in {input:?}");
         }
         if name.is_empty() || name.starts_with('-') {
             bail!("invalid store name in {input:?}");
         }
         ensure!(!name.contains('/'), "store name contains '/': {input:?}");
-        let hash = hash.to_ascii_lowercase();
-        Ok(Self { hash, name: name.to_owned() })
+        Ok(Self {
+            hash: hash.to_owned(),
+            name: name.to_owned(),
+        })
     }
 
     /// The store entry name, e.g. `abc...123-bin`.
@@ -59,9 +67,17 @@ impl StorePath {
 /// Read a completion file: one store path per line, `#` comments and blank
 /// lines ignored.
 pub fn read_completion(path: &Path) -> Result<Vec<StorePath>> {
+    if path == Path::new("-") {
+        return read_completion_reader(std::io::stdin().lock());
+    }
     let file = File::open(path).with_context(|| format!("opening completion file {path:?}"))?;
+    read_completion_reader(file)
+}
+
+/// Parse completion paths from a stream. `-` on the CLI means standard input.
+pub fn read_completion_reader(reader: impl Read) -> Result<Vec<StorePath>> {
     let mut out = Vec::new();
-    for line in BufReader::new(file).lines() {
+    for line in BufReader::new(reader).lines() {
         let line = line.with_context(|| "reading completion file")?;
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -84,8 +100,8 @@ mod tests {
 
     #[test]
     fn parse_bare_entry() {
-        let p = StorePath::parse("abcdefabcdefabcdefabcdefabcdefab-coreutils").unwrap();
-        assert_eq!(p.hash, "abcdefabcdefabcdefabcdefabcdefab");
+        let p = StorePath::parse("abcdfabcdfabcdfabcdfabcdfabcdfab-coreutils").unwrap();
+        assert_eq!(p.hash, "abcdfabcdfabcdfabcdfabcdfabcdfab");
         assert_eq!(p.name, "coreutils");
     }
 
@@ -94,5 +110,20 @@ mod tests {
         assert!(StorePath::parse("/nix/store/short-name").is_err());
         assert!(StorePath::parse("/nix/store/ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ-name").is_err());
         assert!(StorePath::parse("/nix/store/00000000000000000000000000000000-").is_err());
+    }
+
+    #[test]
+    fn accepts_nix32_hash() {
+        let p = StorePath::parse("g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-foo").unwrap();
+        assert_eq!(p.hash, "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q");
+    }
+
+    #[test]
+    fn reads_completion_stream() {
+        let entries = read_completion_reader(std::io::Cursor::new(
+            b"# comment\ng1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-foo\n",
+        ))
+        .unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }

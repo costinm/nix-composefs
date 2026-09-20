@@ -18,7 +18,7 @@ MUSL_TARGET="x86_64-unknown-linux-musl"
 . "${ROOT}/env.sh" "${NCP_NO_NIX:+--no-nix}"
 
 deps() {
-    # Full bundle: nix-composefs + upstream cfsctl + runtime tools.
+    # Generator plus composefs/runtime tools.
     nix profile add --profile "${NCP_PROFILE}" "${ROOT}/#nix-composefs" 2>/dev/null \
         || nix profile install --profile "${NCP_PROFILE}" "${ROOT}/#nix-composefs"
     echo "Profile: ${NCP_PROFILE}"

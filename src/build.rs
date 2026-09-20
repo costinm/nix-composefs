@@ -2,34 +2,32 @@
 //!
 //! Pipeline:
 //!   1. For each store path in the completion, run the composefs-rs scanner
-//!      (`read_filesystem_with_opts`) with a [`Cas`] as the object store. The
+//!      (`read_filesystem_with_opts`) with a composefs-rs [`Repository`] as the object store. The
 //!      scanner walks the real /nix/store objects and references every large
 //!      regular file by its fs-verity digest — no staging copy of the tree.
-//!   2. Small files (<= 64 bytes) are inlined in the EROFS image by the
-//!      scanner; they are additionally stored in the CAS so that workers can
-//!      re-create every store file by hard link.
+//!   2. Small files may be inlined in the EROFS image by the scanner.
 //!   3. The merged tree is validated and written as a V1 (C-compatible)
 //!      EROFS image, which carries only metadata.
-//!   4. A manifest with the full inventory and object list is emitted.
 
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use composefs::erofs::format::FormatVersion;
-use composefs::erofs::writer::{ValidatedFileSystem, mkfs_erofs_versioned};
-use composefs::fs::{HardlinkBehavior, ObjectStore, ReadFilesystemOpts, read_filesystem_with_opts};
-use composefs::fsverity::{FsVerityHashValue, Sha256HashValue};
+use composefs::erofs::writer::{mkfs_erofs_versioned, ValidatedFileSystem};
+use composefs::fs::{read_filesystem_with_opts, HardlinkBehavior, ObjectStore, ReadFilesystemOpts};
+use composefs::fsverity::Sha256HashValue;
 use composefs::generic_tree::{Directory, Inode, Leaf, LeafContent, LeafId, Stat};
+use composefs::repository::{Repository, RepositoryConfig};
 use composefs::tree::{FileSystem, RegularFile};
-use rustix::fs::{Mode, OFlags, open};
+use rustix::fs::{fstat, getxattr, listxattr, open, openat, FileType, Mode, OFlags};
 
-use crate::cas::Cas;
-use crate::manifest::{FileEntry, FileKind, ImageInfo, Manifest, MANIFEST_VERSION, ObjectEntry};
 use crate::store::StorePath;
 
 /// Build options.
@@ -37,36 +35,33 @@ use crate::store::StorePath;
 pub struct BuildOptions {
     /// Root of the Nix store (e.g. /nix/store).
     pub store: PathBuf,
-    /// CAS directory (created if missing).
+    /// composefs-rs repository root (created if missing).
     pub cas: PathBuf,
     /// Output composefs metadata image path.
     pub image: PathBuf,
-    /// Output manifest path (optional).
-    pub manifest: Option<PathBuf>,
-    /// Closure name recorded in the manifest.
-    pub name: String,
     /// Number of scanner worker threads (0 = one per CPU).
     pub threads: usize,
-    /// Userspace-digest fallback (no kernel fs-verity required).
-    pub insecure: bool,
 }
 
 /// Build result summary.
 #[derive(Debug, Clone)]
 pub struct BuildReport {
     pub entries: usize,
-    pub dirs: usize,
-    pub files: usize,
     pub symlinks: usize,
-    pub objects: usize,
     pub image_size: u64,
-    /// fs-verity digest (hex) of the metadata image.
-    pub image_verity: String,
 }
 
-/// Build the image and (optionally) the manifest.
-pub fn build(completion: &[StorePath], opts: &BuildOptions) -> Result<(BuildReport, Manifest)> {
-    let cas: Arc<Cas> = Arc::new(Cas::open(&opts.cas, opts.threads.max(1), opts.insecure)?);
+/// Build an EROFS composefs image and populate its composefs-rs repository.
+pub fn build(completion: &[StorePath], opts: &BuildOptions) -> Result<BuildReport> {
+    // Builder repositories calculate compatible fs-verity digests in
+    // userspace. Deployment tooling can import the result into a repository
+    // with its required-verification policy on the worker.
+    let (cas, _) = Repository::<Sha256HashValue>::init_path(
+        rustix::fs::CWD,
+        &opts.cas,
+        RepositoryConfig::default().set_insecure(),
+    )?;
+    let cas = Arc::new(cas);
 
     let store_fd = open(
         &opts.store,
@@ -89,60 +84,13 @@ pub fn build(completion: &[StorePath], opts: &BuildOptions) -> Result<(BuildRepo
     std::fs::write(&opts.image, &*image)
         .with_context(|| format!("writing image {:?}", opts.image))?;
 
-    let image_verity = composefs::fsverity::compute_verity::<Sha256HashValue>(&image).to_hex();
-
-    // Inventory from the validated tree (exactly what was written).
-    let fs: &FileSystem<Sha256HashValue> = &validated;
-    let (files, objects, dirs, nfiles, symlinks) =
-        walk_inventory(&fs.root, &fs.leaves, &cas)?;
-
     let image_size = std::fs::metadata(&opts.image)?.len();
-    let image_file = opts
-        .image
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "image.composefs".into());
 
-    let manifest = Manifest {
-        version: MANIFEST_VERSION,
-        name: opts.name.clone(),
-        entries: completion.iter().map(|s| s.entry()).collect(),
-        image: ImageInfo {
-            file: image_file,
-            size: image_size,
-            verity: image_verity.clone(),
-        },
-        objects: objects
-            .into_iter()
-            .map(|(digest, (size, count))| ObjectEntry { digest, size, count })
-            .collect(),
-        files,
-        meta: BTreeMap::from([
-            ("tool".to_string(), env!("CARGO_PKG_VERSION").to_string()),
-            ("format".to_string(), "composefs-v1-erofs".to_string()),
-            ("cas-layout".to_string(), "flat-xx-digest".to_string()),
-            ("insecure".to_string(), opts.insecure.to_string()),
-            (
-                "symlink-entries".to_string(),
-                n_symlink_entries.to_string(),
-            ),
-        ]),
-    };
-
-    if let Some(path) = &opts.manifest {
-        manifest.save(path)?;
-    }
-
-    let report = BuildReport {
+    Ok(BuildReport {
         entries: completion.len(),
-        dirs,
-        files: nfiles,
-        symlinks,
-        objects: manifest.objects.len(),
+        symlinks: n_symlink_entries,
         image_size,
-        image_verity,
-    };
-    Ok((report, manifest))
+    })
 }
 
 /// Scan every completion entry and merge the trees under a single root.
@@ -150,7 +98,7 @@ fn scan_completion(
     completion: &[StorePath],
     store: &Path,
     store_fd: &OwnedFd,
-    cas: &Arc<Cas>,
+    cas: &Arc<Repository<Sha256HashValue>>,
     rt: &mut tokio::runtime::Runtime,
 ) -> Result<(FileSystem<Sha256HashValue>, usize)> {
     let mut leaves: Vec<Leaf<RegularFile<Sha256HashValue>>> = Vec::new();
@@ -198,8 +146,16 @@ fn scan_completion(
             continue;
         }
 
+        if st.is_file() {
+            let leaf = scan_regular_store_entry(store_fd, &entry, cas)?;
+            let id = leaves.len();
+            leaves.push(leaf);
+            root.insert(OsStr::new(entry.as_str()), Inode::leaf(LeafId(id)));
+            continue;
+        }
+
         if !st.is_dir() {
-            anyhow::bail!("store entry is not a directory: {entry_path:?}");
+            anyhow::bail!("unsupported store entry type: {entry_path:?}");
         }
 
         let fs: FileSystem<Sha256HashValue> = rt
@@ -222,10 +178,78 @@ fn scan_completion(
         leaves.extend(fs.leaves);
     }
 
-    Ok((
-        FileSystem { root, leaves },
-        n_symlink_entries,
-    ))
+    Ok((FileSystem { root, leaves }, n_symlink_entries))
+}
+
+/// Scan a regular file that is itself a Nix store path.
+///
+/// `read_filesystem_with_opts` intentionally scans directory roots. Nix
+/// closures also contain generated singleton files, so retain their
+/// permissions and use the same inline/external split as composefs-rs.
+fn scan_regular_store_entry(
+    store_fd: &OwnedFd,
+    entry: &str,
+    cas: &Arc<Repository<Sha256HashValue>>,
+) -> Result<Leaf<RegularFile<Sha256HashValue>>> {
+    let fd = openat(
+        store_fd,
+        entry,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("opening regular store entry {entry}"))?;
+    let st = fstat(&fd)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        anyhow::bail!("store entry type changed while scanning: {entry}");
+    }
+    let size: u64 = st
+        .st_size
+        .try_into()
+        .context("regular store entry has a negative size")?;
+    let stat = Stat {
+        st_mode: st.st_mode & 0o7777,
+        st_uid: st.st_uid,
+        st_gid: st.st_gid,
+        st_mtim_sec: st.st_mtime,
+        st_mtim_nsec: st.st_mtime_nsec as u32,
+        xattrs: read_xattrs(&fd)?,
+    };
+    let content = if size <= composefs::INLINE_CONTENT_MAX_V0 as u64 {
+        use std::io::Read;
+
+        let mut data = Vec::with_capacity(size as usize);
+        std::fs::File::from(fd)
+            .read_to_end(&mut data)
+            .context("reading inline regular store entry")?;
+        RegularFile::Inline(data.into_boxed_slice())
+    } else {
+        RegularFile::External(cas.ensure_object_from_fd(fd, size)?, size)
+    };
+    Ok(Leaf {
+        stat,
+        content: LeafContent::Regular(content),
+    })
+}
+
+/// Read xattrs from a descriptor without following an independently supplied
+/// path. This is the small leaf-root counterpart to composefs-rs' directory
+/// scanner, which uses the same `/proc/self/fd` pattern.
+fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
+    let proc_fd = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+    let mut xattrs = BTreeMap::new();
+    let mut names = [MaybeUninit::new(0); 65536];
+    let (names, _) = listxattr(&proc_fd, &mut names)?;
+
+    for name in names.split_inclusive(|c| *c == 0) {
+        let name = CStr::from_bytes_with_nul(name)?;
+        let mut value = [MaybeUninit::new(0); 65536];
+        let (value, _) = getxattr(&proc_fd, name, &mut value)?;
+        xattrs.insert(
+            Box::from(OsStr::from_bytes(name.to_bytes())),
+            Box::from(value),
+        );
+    }
+    Ok(xattrs)
 }
 
 /// Offset every leaf id in a subtree by `offset` (used when merging
@@ -243,105 +267,4 @@ fn remap_leaf_ids(inode: &mut Inode<RegularFile<Sha256HashValue>>, offset: usize
             }
         }
     }
-}
-
-/// Walk the tree, ensuring CAS objects for inline files, collecting the
-/// file inventory and the deduplicated object map.
-fn walk_inventory(
-    dir: &Directory<RegularFile<Sha256HashValue>>,
-    leaves: &[Leaf<RegularFile<Sha256HashValue>>],
-    cas: &Cas,
-) -> Result<(Vec<FileEntry>, BTreeMap<String, (u64, usize)>, usize, usize, usize)> {
-    let mut files = Vec::new();
-    let mut objects: BTreeMap<String, (u64, usize)> = BTreeMap::new();
-    let mut counters = (0usize, 0usize, 0usize);
-    rec_inventory(dir, leaves, cas, "", &mut files, &mut objects, &mut counters)?;
-    Ok((files, objects, counters.0, counters.1, counters.2))
-}
-
-fn rec_inventory(
-    dir: &Directory<RegularFile<Sha256HashValue>>,
-    leaves: &[Leaf<RegularFile<Sha256HashValue>>],
-    cas: &Cas,
-    prefix: &str,
-    files: &mut Vec<FileEntry>,
-    objects: &mut BTreeMap<String, (u64, usize)>,
-    counters: &mut (usize, usize, usize),
-) -> Result<()> {
-    for (name, inode) in dir.sorted_entries() {
-        let name = name.to_string_lossy().into_owned();
-        let rel = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        match inode {
-            Inode::Directory(d) => {
-                files.push(FileEntry {
-                    path: rel.clone(),
-                    kind: FileKind::Dir,
-                    size: 0,
-                    mode: d.stat.st_mode,
-                    digest: None,
-                    target: None,
-                });
-                counters.0 += 1;
-                rec_inventory(d, leaves, cas, &rel, files, objects, counters)?;
-            }
-            Inode::Leaf(id, _) => {
-                let leaf = &leaves[id.0];
-                match &leaf.content {
-                    LeafContent::Regular(rf) => {
-                        let (digest, size) = match rf {
-                            RegularFile::Inline(data) => {
-                                let id = cas
-                                    .ensure_object_from_bytes(data)
-                                    .with_context(|| format!("CAS object for {rel}"))?;
-                                (id.to_hex(), data.len() as u64)
-                            }
-                            RegularFile::External(id, size)
-                            | RegularFile::ExternalNoVerity(id, size) => (id.to_hex(), *size),
-                            RegularFile::Sparse(size) => {
-                                files.push(FileEntry {
-                                    path: rel.clone(),
-                                    kind: FileKind::File,
-                                    size: *size,
-                                    mode: leaf.stat.st_mode,
-                                    digest: None,
-                                    target: None,
-                                });
-                                counters.1 += 1;
-                                continue;
-                            }
-                        };
-                        objects.entry(digest.clone()).or_insert((size, 0)).1 += 1;
-                        files.push(FileEntry {
-                            path: rel,
-                            kind: FileKind::File,
-                            size,
-                            mode: leaf.stat.st_mode,
-                            digest: Some(digest),
-                            target: None,
-                        });
-                        counters.1 += 1;
-                    }
-                    LeafContent::Symlink(target) => {
-                        files.push(FileEntry {
-                            path: rel,
-                            kind: FileKind::Symlink,
-                            size: 0,
-                            mode: leaf.stat.st_mode,
-                            digest: None,
-                            target: Some(target.to_string_lossy().into_owned()),
-                        });
-                        counters.2 += 1;
-                    }
-                    other => {
-                        anyhow::bail!("unsupported leaf type at {rel}: {other:?}");
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }

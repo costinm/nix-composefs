@@ -1,5 +1,5 @@
 {
-  description = "nix-composefs — /nix/store as a signed, syncable composefs store";
+  description = "nix-composefs — composefs images and digest stores for Nix closures";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -8,14 +8,9 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
-    flake-utils.url = "github:numtide/flake-utils";
-    composefs-rs = {
-      url = "github:containers/composefs-rs/v0.9.2";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane, flake-utils, composefs-rs }:
+  outputs = { self, nixpkgs, rust-overlay, crane }:
     let
       system = "x86_64-linux";
       muslTarget = "x86_64-unknown-linux-musl";
@@ -62,55 +57,22 @@
         doCheck = true;
       } // muslArgs);
 
-      # Upstream cfsctl (composefs mkfs/mount/pull etc.), built from the same
-      # composefs-rs sources the crate dependency comes from. Upstream ships
-      # no Cargo.lock, so a generated one (deduplicated crates.io
-      # resolution) is committed at tools/composefs-rs-Cargo.lock and copied
-      # into the source tree before vendoring.
-      composefsRsWithLock = pkgs.runCommand "composefs-rs-src-with-lock" { } ''
-        cp -r ${composefs-rs} $out
-        chmod -R u+w $out
-        cp ${./tools/composefs-rs-Cargo.lock} $out/Cargo.lock
-      '';
-
-      composefsCfsctl = craneLib.buildPackage ({
-        pname = "cfsctl";
-        version = "0.9.2";
-        src = composefsRsWithLock;
-        strictDeps = true;
-        doCheck = false;
-        cargoExtraArgs = "--bin cfsctl";
-        cargoVendorDir = craneLib.vendorCargoDeps { src = composefsRsWithLock; };
-        nativeBuildInputs = nativeBuildInputs;
-        # cfsctl's openssl-sys is not built vendored upstream; link against
-        # the musl (pkgsStatic) OpenSSL so the result stays static.
-        OPENSSL_LIB_DIR = "${pkgs.pkgsStatic.openssl.out}/lib";
-        OPENSSL_INCLUDE_DIR = "${pkgs.pkgsStatic.openssl.dev}/include";
-        OPENSSL_STATIC = "true";
-      } // muslArgs);
-
-      # Runtime tooling for the sync/verify workflow (SSH transfer, verity,
-      # erofs inspection). fuse3 provides fusermount3, needed by cfsctl's
-      # FUSE mount. Consumed by env.sh via the profile bin/.
+      # Runtime tooling used by external transport and InitOS verification.
       deps = pkgs.symlinkJoin {
         name = "nix-composefs-deps";
         paths = with pkgs; [
           coreutils
           erofs-utils
-          findutils
           fsverity-utils
           fuse3
-          gnused
-          openssh
-          rsync
-          gnutar
+          composefs
         ];
       };
 
-      # Full bundle: our binary + upstream cfsctl + runtime tools.
+      # Full bundle: our generator plus runtime inspection tools.
       nixComposefsFull = pkgs.symlinkJoin {
         name = "nix-composefs-bundle";
-        paths = [ nixComposefs composefsCfsctl deps ];
+        paths = [ nixComposefs deps ];
       };
 
       muslCc = pkgs.pkgsStatic.stdenv.cc;
@@ -135,7 +97,6 @@
         default = nixComposefsFull;
         "nix-composefs" = nixComposefsFull;
         "nix-composefs-bin" = nixComposefs;
-        cfsctl = composefsCfsctl;
         inherit nixComposefs deps;
       };
       devShells.${system}.default = devShell;

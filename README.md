@@ -1,153 +1,76 @@
 # nix-composefs
 
-`/nix/store` as a **signed, syncable composefs store**.
+Build composefs V1 EROFS metadata images and composefs-rs repositories from
+Nix closures. It is for builder-to-worker deployment of complete immutable
+generations, not a replacement for normal Nix store copy or daemon semantics.
 
-This is a rust CLI that turns a /nix/store subset into a 
-syncable composefs store and fs-verity and public key signed 
-Erofs metadata image. 
+`nix-composefs` is deliberately build-side only. It uses composefs-rs for the
+tree scanner, EROFS writer, and its `Repository` object store. The repository
+root is `/z/composefs`; its objects retain the compatible
+`/z/composefs/objects/xx/<digest>` layout while upstream manages repository
+metadata, references, garbage collection, and OCI transport.
 
-Trusted build machine: find all dependencies (NixOS closure), content-address every regular file into a fs-verity object store
-(composefs CAS), emit a composefs **metadata EROFS image** plus a **manifest**, and
-sign the image with the same conventions as initos erofs images.
-The input is a list of packages (`nix-store -q --refclosure`).
+costinm/initos or another project owns image signing, verification, import, and runtime mounting.
 
+Syncing the CAS is also out of scope - plenty of ways to do it.
 
-Worker: pull the missing CAS objects and erofs, verify signature and re-create `/nix/store` by **hard-linking** store entries into the CAS. The same CAS serves any number of closures — identical content is stored once (dedup like `nix store optimise`, but keyed by fs-verity
-digest instead of re-hashing).
+## Trust model
 
-The nix store files will have fs-verity enabled, so any change is detected at runtime. The directories are verified by the 
-erofs fs-verity has which is signed by the builder private key.
+The signed composefs image is the sole filesystem manifest. It contains the
+authenticated directory tree, per-path metadata, backing-object redirects, and
+expected fs-verity digests. OCI, SSH, rsync, or another transport may deliver
+the image and objects, but cannot alter the mounted tree without failing
+fs-verity or InitOS image-signature verification.
 
-Assuming secure EFI boot, signed kernel and init and full chain - after a reboot the file integrity should be verified. An attacker getting access can still break the system - but after reboot changes will be detected.
-
-Built on [composefs-rs](https://github.com/containers/composefs-rs)
-(`composefs` 0.9.x): the scanner, the V1 (C-compatible) EROFS writer, and
-fs-verity support come from the library; this project adds the Nix-store
-specifics (completion, manifest, store materialization, initos-compatible
-signing).
-
-## Layout
-
-```
-src/lib.rs         crate root (re-exports composefs fs-verity types)
-src/store.rs       store path grammar + completion files
-src/cas.rs         fs-verity CAS (flat xx/digest layout), ObjectStore impl
-src/build.rs       completion -> merged tree -> V1 EROFS image + manifest
-src/manifest.rs    completion manifest (JSON): paths, inventory, objects
-src/sync.rs        missing / import / materialize / optimise
-src/sign.rs        Ed25519 + UEFI db signing & verification (initos layout)
-src/main.rs        CLI
-tests/             end-to-end build->materialize->compare + sign roundtrip
+```text
+InitOS image signature -> EROFS fs-verity digest -> composefs metadata
+                                                    -> backing-object digest
 ```
 
-## Build (everything from Nix)
+Workers mount the verified image; they do not materialize a writable physical
+`/nix/store`. This preserves the authenticated per-path permissions and avoids
+requiring a Nix daemon or validity database on constrained workers.
+
+## Build
 
 ```sh
-nix build .#nix-composefs          # bundle: nix-composefs + upstream cfsctl + runtime tools (musl)
-nix build .#cfsctl                 # upstream composefs-rs cfsctl alone
-nix build .#deps                   # runtime tools only (erofs-utils, fsverity-utils, ...)
+nix-store -q --refclosure XXX | nix-composefs --image system.composefs
 ```
 
-Iterative development (Nix profile under `target/`, host untouched):
+The completion defaults to standard input; `/nix/store` and
+`/z/composefs` are the default store and repository paths. Use `--paths`,
+`--store`, or `--cas` only when a build needs different locations. The build
+populates the repository object store and produces a metadata-only EROFS image.
+
+The builder computes composefs-compatible fs-verity digests in userspace, so
+its filesystem does not need fs-verity support.
+
+Sign the resulting image through the existing InitOS release flow, ship it and
+the referenced objects through the chosen transport, import objects with
+fs-verity, then have InitOS verify and mount it with verity enforcement.
+
+## Development
 
 ```sh
-. ./env.sh                        # refreshes target/nix/profiles/profile, exports PATH
-ncp-build                         # cargo build --release --target x86_64-unknown-linux-musl (state in target/cargo)
+nix build .#nix-composefs
+nix build .#deps
+
+. ./env.sh
+ncp-build
 ncp-test
-ncp build --help                  # runs target/cargo/x86_64-unknown-linux-musl/release/nix-composefs
 ```
 
-`nix-composefs` and `cfsctl` are statically linked with musl (initos
-conventions); the deps/runtime tools stay glibc.
+The bundle includes the generator plus standard composefs, EROFS, and
+fs-verity runtime tools. It does not bundle a separate composefs-rs checkout
+or duplicate upstream object-store implementation.
 
-Local cargo runs need the musl cc and the vendored-openssl build tools; get them via `nix develop`, or install gnumake/perl directly:
+## Deliberate boundaries
 
-```sh
-nix shell nixpkgs#gnumake nixpkgs#perl --command cargo test
-```
-
-## Usage
-
-Build machine (e.g. the initos SIGN_HOST):
-
-```sh
-# completion: one store path per line (e.g. from a NixOS system closure)
-nix-composefs build \
-  --store /nix/store \
-  --cas /z/img/composefs/objects \
-  --paths system-closure.txt \
-  --image system.composefs \
-  --manifest system.json \
-  --name system-25.05
-
-nix-composefs sign --image system.composefs --secrets /path/to/uefi-keys
-# -> system.composefs.sig (Ed25519) and/or system.composefs.<keyid>.db.sig (UEFI db)
-```
-
-Worker:
-
-```sh
-nix-composefs missing   --manifest system.json --cas $CAS        # one rel. path per line
-# tar those paths over SSH/rsync/OCI into the worker's $CAS
-nix-composefs import    --manifest system.json --cas $CAS        # enable fs-verity
-nix-composefs verify    --image system.composefs --key "$(cat image_key.pub.b64)"
-nix-composefs materialize --manifest system.json --cas $CAS --store /nix/store
-```
-
-Mount the composed view (kernel composefs, verity enforced):
-
-```sh
-mount -t composefs -o "basedir=$CAS,verity,ro" system.composefs /mnt/nix
-# or overlayfs style:
-mount -t overlay -o "ro,lowerdir=/mnt/nix-meta::$CAS,verity=require" composefs /mnt/nix
-```
-
-Dedup an existing store into the CAS (like `nix store optimise`):
-
-```sh
-nix-composefs optimise --manifest system.json --cas $CAS --store /nix/store
-```
-
-## Design notes
-
-- **Object identity is the fs-verity digest**, not the Nix sha256 path hash.
-  The CAS layout is C-compatible flat `xx/<digest>` (same as the initos
-  firmware CAS). The metadata image records each regular file's verity
-  digest (overlay metacopy xattr) and redirect; the kernel verifies content
-  at read time when mounted with `verity`.
-- **Direct store objects**: the composefs-rs scanner walks the real
-  `/nix/store` entries; the custom `ObjectStore` streams each file into the
-  CAS (copy_file_range, reflink on CoW fs) instead of an intermediate
-  staging tree. Nix store files are immutable (`chattr +i`), so the CAS
-  holds copies of their inodes — dedup happens *into* the CAS from the
-  store (`optimise`) and between closures (shared objects), and workers
-  re-create the store as hard links to CAS objects.
-- **Small files (<= 64 B)** are inlined in the EROFS image by composefs
-  (format constant), and additionally stored in the CAS so materialization
-  never needs to parse the image.
-- **Signing** mirrors `initos verify`: Ed25519 over the raw fs-verity
-  digest in `<image>.sig` (key `image_key.pem`, pubkey
-  `image_key.pub.b64`), and PKCS#1 v1.5 SHA-256 in
-  `<image>.<keyid>.db.sig` (`keyid` = first 16 hex of
-  SHA-256(SPI DER of `db.crt`)). A signed composefs image therefore drops
-  into the existing `initos verify` flow unchanged.
-- **`--insecure`** enables userspace digests when the backing filesystem
-  lacks fs-verity (tmpfs/overlayfs dev machines); production workers use
-  verity enforcement.
-
-## Limitations / open items
-
-- The nix store's own `chattr +i` blocks hard-linking store files *from*
-  the store; `optimise` unlinks + relinks and reports immutable files
-  instead of forcing `chattr -i`.
-- Materialization recreates paths/dirs/symlinks/hard links; it does not
-  register paths with a nix daemon (no `validity.db` integration yet).
-- GC of the CAS: keep an immutable generation per closure set and only
-  collect objects no installed closure references (see initos firmware GC
-  policy in `notes/ai/2026-09-08-composefs-git-firmware-rollout.md`).
-
-# TODO
-
-- use the previous version to compute the missing objects to be transmitted or packaged. The same idea used in initos for OCI, we can have a periodic large binary (monthly) and incremental deltas - the worker can be simpler and may not need to track
-nix packages or run a daemon. So instead of rsync-like (find what worker has, send what is missing) keep track here of what 
-the worker is supposed to have, send changed.
+- No JSON filesystem manifest: use the signed EROFS image as authority.
+- No signing implementation: use InitOS’s existing signature chain.
+- No transport implementation: OCI remains the current delivery mechanism.
+- No hard-link materialization or Nix daemon registration.
+- No local garbage-collection or transport implementation: use upstream
+  composefs-rs `cfsctl` repository operations (including OCI and GC) when the
+  deployment flow needs them. InitOS remains responsible for selecting only
+  verified, signed images on workers.
