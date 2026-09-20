@@ -13,9 +13,9 @@ use nix_composefs::store::read_completion;
 #[derive(Parser)]
 #[command(name = "nix-composefs", version, about)]
 struct Cli {
-    /// Output composefs metadata image.
+    /// Name of the composefs image reference created in the repository.
     #[arg(long)]
-    image: PathBuf,
+    image: String,
     /// Nix store root.
     #[arg(long, default_value = "/nix/store")]
     store: PathBuf,
@@ -56,12 +56,15 @@ fn run() -> Result<()> {
         &completion,
         &BuildOptions {
             store: cli.store,
-            cas: cli.cas,
+            cas: cli.cas.clone(),
             image: cli.image.clone(),
             threads,
         },
     )?;
-    println!("image:   {:?} ({} bytes)", cli.image, report.image_size);
+    println!(
+        "image:   {:?} in {:?}/images/refs ({} bytes)",
+        cli.image, cli.cas, report.image_size
+    );
     println!(
         "entries: {}  symlink entries: {}",
         report.entries, report.symlinks

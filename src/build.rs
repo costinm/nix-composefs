@@ -37,8 +37,8 @@ pub struct BuildOptions {
     pub store: PathBuf,
     /// composefs-rs repository root (created if missing).
     pub cas: PathBuf,
-    /// Output composefs metadata image path.
-    pub image: PathBuf,
+    /// Name of the image reference created in the repository.
+    pub image: String,
     /// Number of scanner worker threads (0 = one per CPU).
     pub threads: usize,
 }
@@ -81,10 +81,10 @@ pub fn build(completion: &[StorePath], opts: &BuildOptions) -> Result<BuildRepor
 
     let validated = ValidatedFileSystem::new(tree).context("validating merged tree")?;
     let image = mkfs_erofs_versioned(&validated, FormatVersion::V1);
-    std::fs::write(&opts.image, &*image)
-        .with_context(|| format!("writing image {:?}", opts.image))?;
+    cas.write_image(Some(&opts.image), &image)
+        .context("recording image in composefs repository")?;
 
-    let image_size = std::fs::metadata(&opts.image)?.len();
+    let image_size = image.len() as u64;
 
     Ok(BuildReport {
         entries: completion.len(),

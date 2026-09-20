@@ -37,21 +37,21 @@ fn build_populates_repository_from_nix32_completion() {
     );
 
     let cas = root.join("repository");
-    let image = root.join("system.composefs");
+    let image = "system.composefs";
     let report = build(
         &paths,
         &BuildOptions {
             store,
             cas: cas.clone(),
-            image: image.clone(),
+            image: image.into(),
             threads: 1,
         },
     )
     .unwrap();
 
     assert_eq!(report.entries, 2);
-    assert!(image.is_file());
     assert!(cas.join("meta.json").is_file());
+    assert!(cas.join("images/refs/system.composefs").is_symlink());
     assert!(
         std::fs::read_dir(cas.join("objects"))
             .unwrap()
