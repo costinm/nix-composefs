@@ -86,6 +86,30 @@ should derive the missing digest set from the signed image and stream only
 those objects, enabling fs-verity before atomically publishing each one under
 `objects/xx/<digest>`.
 
+### Garbage collection
+
+`nix-composefs gc` collects unreferenced objects in `objects/xx/<digest>` while
+preserving:
+
+- Objects reachable from EROFS images under `images/refs/**` (or `streams/refs/**`)
+  and explicit `-r`/`--root` or positional anchor paths/names.
+- Any EROFS image in `images/` whose backing file is hardlinked (`st_nlink > 1`)
+  or currently mounted/locked (`flock`), keeping both the image and every
+  object it references alive.
+- Any individual object in `objects/xx/<digest>` with `st_nlink > 1` (e.g.
+  hardlinked into an external directory or another CAS) or an active `flock`.
+
+Sidecar signature files (`*.sig`, `*.db.sig`, `*.basedir`) placed under
+`images/refs/` are tolerated and left untouched.
+
+```sh
+# Preview deletions without modifying /z/composefs:
+nix-composefs gc --cas /z/composefs --dry-run
+
+# Run GC, optionally supplying external EROFS anchors:
+nix-composefs gc --cas /z/composefs -r /z/initos/101/firmware-light.composefs
+```
+
 ## Development
 
 ```sh
@@ -107,7 +131,8 @@ or duplicate upstream object-store implementation.
 - No signing implementation: use InitOS’s existing signature chain.
 - No transport implementation: OCI remains the current delivery mechanism.
 - No hard-link materialization or Nix daemon registration.
-- No local garbage-collection or transport implementation: use upstream
-  composefs-rs `cfsctl` repository operations (including OCI and GC) when the
-  deployment flow needs them. InitOS remains responsible for selecting only
-  verified, signed images on workers.
+- GC (`nix-composefs gc`) preserves EROFS image anchors (`images/refs/**`,
+  `streams/refs/**`, explicit `-r`/positional anchors, hardlinked EROFS images)
+  as well as externally hardlinked objects (`st_nlink > 1`). Use upstream
+  `cfsctl` for OCI transport operations. InitOS remains responsible for
+  selecting only verified, signed images on workers.
