@@ -1,9 +1,9 @@
 //! Nix store path grammar and completion files.
 //!
-//! A store path is `/nix/store/<sha256-hex>-<name>` (the leading `/nix/store/`
-//! or a bare `<sha256-hex>-<name>` is also accepted). A completion file is a
+//! A store path is `/nix/store/<nix32-hash>-<name>` (the leading `/nix/store/`
+//! or a bare `<nix32-hash>-<name>` is also accepted). A completion file is a
 //! list of store paths, one per line, e.g. the output of
-//! `nix-store -q --refclosure <path>` or a NixOS system closure.
+//! `nix-store -qR <path>` or a NixOS system closure.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};

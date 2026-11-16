@@ -6,6 +6,7 @@
 //! signed image is the sole filesystem manifest at runtime.
 
 pub mod build;
+pub mod checkout;
 pub mod gc;
 pub mod store;
 

@@ -1,4 +1,4 @@
-//! Build a Nix32-named closure into an upstream composefs repository.
+//! Build a Nix32-named closure into a composefs digest store and image ref tree.
 
 use std::path::Path;
 
@@ -41,7 +41,7 @@ fn build_populates_repository_from_nix32_completion() {
     let report = build(
         &paths,
         &BuildOptions {
-            store,
+            store: store.clone(),
             cas: cas.clone(),
             image: image.into(),
             threads: 1,
@@ -50,8 +50,12 @@ fn build_populates_repository_from_nix32_completion() {
     .unwrap();
 
     assert_eq!(report.entries, 2);
-    assert!(cas.join("meta.json").is_file());
+    assert!(
+        !cas.join("meta.json").exists(),
+        "meta.json is strictly optional and not emitted by default"
+    );
     assert!(cas.join("images/refs/system.composefs").is_symlink());
+    assert!(cas.join("images/refs/system.composefs").exists());
     assert!(
         std::fs::read_dir(cas.join("objects"))
             .unwrap()
@@ -59,4 +63,40 @@ fn build_populates_repository_from_nix32_completion() {
             .is_some(),
         "repository object store is populated"
     );
+
+    // Compatible optional meta.json works identically.
+    std::fs::write(
+        cas.join("meta.json"),
+        r#"{"version":1,"algorithm":"fsverity-sha256-12"}"#,
+    )
+    .unwrap();
+    let nested = build(
+        &paths,
+        &BuildOptions {
+            store: store.clone(),
+            cas: cas.clone(),
+            image: "slots/101.composefs".into(),
+            threads: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(nested.entries, 2);
+    assert!(cas.join("images/refs/slots/101.composefs").exists());
+
+    // Incompatible meta.json algorithm is rejected.
+    std::fs::write(
+        cas.join("meta.json"),
+        r#"{"version":1,"algorithm":"fsverity-sha512-12"}"#,
+    )
+    .unwrap();
+    assert!(build(
+        &paths,
+        &BuildOptions {
+            store,
+            cas,
+            image: "bad.composefs".into(),
+            threads: 1,
+        },
+    )
+    .is_err());
 }

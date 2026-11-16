@@ -2,12 +2,13 @@
 //!
 //! Collects unreferenced objects in `objects/xx/<digest>` while preserving:
 //! - Objects reachable from EROFS images anchored in `images/refs/**`,
-//!   `streams/refs/**`, explicit CLI roots (`-r` / `--root` / anchor paths),
-//!   active `flock`s, or EROFS images in `images/` whose backing file is
-//!   hardlinked (`st_nlink > 1`).
-//! - Any object in `objects/xx/<digest>` with `st_nlink > 1` (hardlinked into
-//!   an external directory such as an extracted rootfs or boot store) or an
-//!   active `flock`.
+//!   `streams/refs/**`, or actively mounted/locked images (`flock`).
+//! - Any individual object in `objects/xx/<digest>` with `st_nlink > 1`
+//!   (files checked out externally via hardlinks, consistent with OSTree
+//!   bare hardlink checkouts) or an active `flock`.
+//!
+//! `meta.json` is strictly optional; defaults match `fsverity-sha256-12` and
+//! V1 EROFS images.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -19,12 +20,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use composefs::erofs::reader::collect_objects;
-use composefs::fsverity::{FsVerityHashValue, Sha256HashValue};
-use composefs::repository::Repository;
+use composefs::fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue};
+use composefs::repository::read_repo_algorithm;
 use composefs::splitstream::SplitStreamReader;
 use rustix::fs::{
-    flock, open, openat, readlinkat, statat, unlinkat, AtFlags, Dir, FileType, FlockOperation,
-    Mode, OFlags, Stat,
+    accessat, flock, open, openat, readlinkat, statat, unlinkat, Access, AtFlags, Dir, FileType,
+    FlockOperation, Mode, OFlags,
 };
 use rustix::io::Errno;
 
@@ -33,8 +34,6 @@ use rustix::io::Errno;
 pub struct GcOptions {
     /// Repository root (e.g. `/z/composefs`) or bare `objects` directory.
     pub cas: PathBuf,
-    /// Additional root image names (in `images/` or `images/refs/`) or external EROFS file paths.
-    pub roots: Vec<String>,
     /// If true, only report what would be removed without unlinking anything.
     pub dry_run: bool,
 }
@@ -44,7 +43,7 @@ pub struct GcOptions {
 pub struct GcReport {
     /// Objects reachable from EROFS image anchors or streams.
     pub objects_reachable: u64,
-    /// Unreferenced objects kept solely because `st_nlink > 1` (hardlinked externally).
+    /// Unreferenced objects kept solely because `st_nlink > 1` (checked out via hardlinks).
     pub objects_hardlinked_kept: u64,
     /// Total bytes of objects kept via `st_nlink > 1`.
     pub hardlinked_bytes: u64,
@@ -54,32 +53,34 @@ pub struct GcReport {
     pub objects_removed: u64,
     /// Total bytes of removed objects.
     pub bytes_removed: u64,
-    /// Broken symlinks pruned from `images/` and `images/refs/`.
+    /// Broken or unanchored symlinks pruned from `images/` and `images/refs/`.
     pub images_pruned: u64,
-    /// Broken symlinks pruned from `streams/` and `streams/refs/`.
+    /// Broken or unanchored symlinks pruned from `streams/` and `streams/refs/`.
     pub streams_pruned: u64,
 }
 
 /// Run garbage collection against `opts.cas`.
 pub fn gc(opts: &GcOptions) -> Result<GcReport> {
-    if opts.cas.join("meta.json").exists() {
-        // Validate metadata compatibility and writable feature flags before
-        // dropping the handle so its shared flock does not conflict with the
-        // exclusive lock acquired below.
-        let repo = Repository::<Sha256HashValue>::open_path(rustix::fs::CWD, &opts.cas)
-            .with_context(|| format!("opening repository {:?}", opts.cas))?;
-        if !opts.dry_run {
-            repo.ensure_writable()
-                .with_context(|| format!("checking writability of {:?}", opts.cas))?;
-        }
-    }
-
     let repo_fd = open(
         &opts.cas,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .with_context(|| format!("opening repository directory {:?}", opts.cas))?;
+
+    if let Some(alg) = read_repo_algorithm(&repo_fd)? {
+        if alg != Algorithm::SHA256 {
+            bail!(
+                "repository algorithm {alg} does not match expected {}",
+                Algorithm::SHA256
+            );
+        }
+    }
+
+    if !opts.dry_run {
+        accessat(&repo_fd, ".", Access::WRITE_OK, AtFlags::empty())
+            .with_context(|| format!("repository {:?} is not writable", opts.cas))?;
+    }
 
     let lock_op = if opts.dry_run {
         FlockOperation::LockShared
@@ -116,38 +117,15 @@ pub fn gc(opts: &GcOptions) -> Result<GcReport> {
     let mut live_objects = HashSet::new();
     let mut parsed_erofs_ids = HashSet::new();
 
-    let mut extra_roots: HashSet<String> = HashSet::new();
-    for root in &opts.roots {
-        extra_roots.insert(root.clone());
-        if let Some(stripped) = root.strip_prefix("refs/") {
-            extra_roots.insert(stripped.to_owned());
-        }
-        if let Some(stripped) = root.strip_prefix("images/refs/") {
-            extra_roots.insert(stripped.to_owned());
-        }
-        if let Some(stripped) = root.strip_prefix("images/") {
-            extra_roots.insert(stripped.to_owned());
-        }
-        if let Some(stripped) = root.strip_prefix("streams/refs/") {
-            extra_roots.insert(stripped.to_owned());
-        }
-        if let Some(stripped) = root.strip_prefix("streams/") {
-            extra_roots.insert(stripped.to_owned());
-        }
-    }
-
-    let mut matched_roots = HashSet::new();
     let mut all_images: HashMap<String, Sha256HashValue> = HashMap::new();
     let mut image_ids: HashSet<Sha256HashValue> = HashSet::new();
     let mut all_streams: HashMap<String, Sha256HashValue> = HashMap::new();
     let mut id_to_stream_name: HashMap<Sha256HashValue, String> = HashMap::new();
-    let mut matched_stream_refs: HashSet<String> = HashSet::new();
 
     if has_repo_root {
         // 1. Collect images/ and images/refs/
         if let Some(images_fd) = open_optional_dir(&repo_fd, "images")? {
             let mut root_image_names = HashSet::new();
-            let mut ref_names_seen = HashSet::new();
 
             for item in Dir::read_from(&images_fd).context("reading images/ directory")? {
                 let entry = item.context("reading images/ entry")?;
@@ -173,11 +151,17 @@ pub fn gc(opts: &GcOptions) -> Result<GcReport> {
                     FileType::RegularFile => {
                         if !is_sidecar_bytes(filename.to_bytes()) {
                             let data = read_fd_bytes(
-                                openat(&images_fd, filename, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-                                    .with_context(|| format!("opening images/{filename:?}"))?,
+                                openat(
+                                    &images_fd,
+                                    filename,
+                                    OFlags::RDONLY | OFlags::CLOEXEC,
+                                    Mode::empty(),
+                                )
+                                .with_context(|| format!("opening images/{filename:?}"))?,
                             )?;
-                            collect_erofs_bytes(&data, &mut live_objects)
-                                .with_context(|| format!("reading EROFS image images/{filename:?}"))?;
+                            collect_erofs_bytes(&data, &mut live_objects).with_context(|| {
+                                format!("reading EROFS image images/{filename:?}")
+                            })?;
                         }
                     }
                     _ => {}
@@ -190,40 +174,18 @@ pub fn gc(opts: &GcOptions) -> Result<GcReport> {
                     "",
                     &all_images,
                     &mut root_image_names,
-                    &mut ref_names_seen,
                     &mut live_objects,
                     &mut parsed_erofs_ids,
                 )?;
             }
 
-            for root in &opts.roots {
-                let trimmed = root
-                    .strip_prefix("images/refs/")
-                    .or_else(|| root.strip_prefix("refs/"))
-                    .unwrap_or(root);
-                if ref_names_seen.contains(trimmed) {
-                    matched_roots.insert(root.clone());
-                }
-            }
-
             for (name, id) in &all_images {
-                let hex = id.to_hex();
-                let is_extra = extra_roots.contains(name) || extra_roots.contains(&hex);
-                if is_extra {
-                    for root in &opts.roots {
-                        let trimmed = root.strip_prefix("images/").unwrap_or(root);
-                        if trimmed == name || trimmed == hex {
-                            matched_roots.insert(root.clone());
-                        }
-                    }
-                }
-
-                let is_nlink_or_locked = match objects_fd.as_ref() {
-                    Some(obj_dir) => object_is_hardlinked_or_locked(obj_dir, id)?,
+                let is_locked = match objects_fd.as_ref() {
+                    Some(obj_dir) => is_object_locked(obj_dir, id)?,
                     None => false,
                 };
 
-                if root_image_names.contains(name) || is_extra || is_nlink_or_locked {
+                if root_image_names.contains(name) || is_locked {
                     live_objects.insert(id.clone());
                     if !parsed_erofs_ids.contains(id) {
                         if let Some(obj_dir) = objects_fd.as_ref() {
@@ -265,42 +227,15 @@ pub fn gc(opts: &GcOptions) -> Result<GcReport> {
             }
 
             if let Some(refs_fd) = open_optional_dir(&streams_fd, "refs")? {
-                walk_stream_refs(
-                    &refs_fd,
-                    "",
-                    &all_streams,
-                    &mut root_stream_names,
-                    &mut matched_stream_refs,
-                    &mut live_objects,
-                )?;
-            }
-
-            for root in &opts.roots {
-                let trimmed = root
-                    .strip_prefix("streams/refs/")
-                    .or_else(|| root.strip_prefix("refs/"))
-                    .unwrap_or(root);
-                if matched_stream_refs.contains(trimmed) {
-                    matched_roots.insert(root.clone());
-                }
+                walk_stream_refs(&refs_fd, "", &all_streams, &mut root_stream_names, &mut live_objects)?;
             }
 
             for (name, id) in &all_streams {
-                let hex = id.to_hex();
-                let is_extra = extra_roots.contains(name) || extra_roots.contains(&hex);
-                if is_extra {
-                    for root in &opts.roots {
-                        let trimmed = root.strip_prefix("streams/").unwrap_or(root);
-                        if trimmed == name || trimmed == hex {
-                            matched_roots.insert(root.clone());
-                        }
-                    }
-                }
-                let is_nlink_or_locked = match objects_fd.as_ref() {
-                    Some(obj_dir) => object_is_hardlinked_or_locked(obj_dir, id)?,
+                let is_locked = match objects_fd.as_ref() {
+                    Some(obj_dir) => is_object_locked(obj_dir, id)?,
                     None => false,
                 };
-                if is_extra || is_nlink_or_locked {
+                if is_locked {
                     root_stream_names.insert(name.clone());
                 }
             }
@@ -323,43 +258,7 @@ pub fn gc(opts: &GcOptions) -> Result<GcReport> {
         }
     }
 
-    // 3. Resolve remaining explicit CLI roots / external EROFS anchor paths
-    for root in &opts.roots {
-        if matched_roots.contains(root) {
-            continue;
-        }
-        if let (Some(obj_dir), Ok(id)) = (objects_fd.as_ref(), Sha256HashValue::from_hex(root)) {
-            if let Some(fd) = open_object_optional(obj_dir, &id)? {
-                live_objects.insert(id.clone());
-                if !parsed_erofs_ids.contains(&id) {
-                    let data = read_fd_bytes(fd)?;
-                    collect_erofs_bytes(&data, &mut live_objects)
-                        .with_context(|| format!("collecting objects from image {root}"))?;
-                    parsed_erofs_ids.insert(id);
-                }
-                continue;
-            }
-        }
-
-        let path = Path::new(root);
-        if path.is_file() {
-            let mut data = Vec::new();
-            File::open(path)
-                .with_context(|| format!("opening anchor image {:?}", path))?
-                .read_to_end(&mut data)
-                .with_context(|| format!("reading anchor image {:?}", path))?;
-            collect_erofs_bytes(&data, &mut live_objects)
-                .with_context(|| format!("parsing anchor EROFS image {:?}", path))?;
-            if let Ok(id) = Sha256HashValue::from_object_pathname(root.as_bytes()) {
-                live_objects.insert(id);
-            }
-            continue;
-        }
-
-        bail!("anchor not found: {root}");
-    }
-
-    // 4. Sweep objects/00..ff/<62-hex>
+    // 3. Sweep objects/00..ff/<62-hex>
     let mut removed_objects = HashSet::new();
     if let Some(obj_dir) = objects_fd.as_ref() {
         for first_byte in 0x00..=0xffu8 {
@@ -394,16 +293,15 @@ pub fn gc(opts: &GcOptions) -> Result<GcReport> {
                     continue;
                 }
 
+                // Preserve externally hardlinked objects (checked-out files).
                 if stat.st_nlink > 1 {
                     report.objects_hardlinked_kept += 1;
                     report.hardlinked_bytes += size;
-                    live_objects.insert(id);
                     continue;
                 }
 
                 if is_file_locked(&dirfd, filename)? {
                     report.objects_locked_kept += 1;
-                    live_objects.insert(id);
                     continue;
                 }
 
@@ -420,11 +318,17 @@ pub fn gc(opts: &GcOptions) -> Result<GcReport> {
         }
     }
 
-    // 5. Clean up broken symlinks in images/ and streams/
+    // 4. Clean up broken or unanchored symlinks in images/ and streams/
     if has_repo_root {
-        report.images_pruned = cleanup_category(&repo_fd, "images", &removed_objects, opts.dry_run)?;
-        report.streams_pruned =
-            cleanup_category(&repo_fd, "streams", &removed_objects, opts.dry_run)?;
+        report.images_pruned =
+            cleanup_category(&repo_fd, "images", &live_objects, &removed_objects, opts.dry_run)?;
+        report.streams_pruned = cleanup_category(
+            &repo_fd,
+            "streams",
+            &live_objects,
+            &removed_objects,
+            opts.dry_run,
+        )?;
     }
 
     Ok(report)
@@ -479,16 +383,8 @@ fn entry_file_type(dirfd: &OwnedFd, name: &CStr, d_type: FileType) -> Result<Fil
     Ok(FileType::from_raw_mode(st.st_mode))
 }
 
-fn object_is_hardlinked_or_locked(objects_fd: &OwnedFd, id: &Sha256HashValue) -> Result<bool> {
+fn is_object_locked(objects_fd: &OwnedFd, id: &Sha256HashValue) -> Result<bool> {
     let rel = id.to_object_pathname();
-    let st: Stat = match statat(objects_fd, &rel, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(st) => st,
-        Err(Errno::NOENT) => return Ok(false),
-        Err(e) => return Err(e).with_context(|| format!("statting objects/{rel}")),
-    };
-    if st.st_nlink > 1 {
-        return Ok(true);
-    }
     let rel_c = CString::new(rel.as_bytes()).context("building object pathname")?;
     is_file_locked(objects_fd, &rel_c)
 }
@@ -516,7 +412,6 @@ fn walk_image_refs(
     rel_prefix: &str,
     all_images: &HashMap<String, Sha256HashValue>,
     root_image_names: &mut HashSet<String>,
-    ref_names_seen: &mut HashSet<String>,
     live_objects: &mut HashSet<Sha256HashValue>,
     parsed_erofs_ids: &mut HashSet<Sha256HashValue>,
 ) -> Result<()> {
@@ -549,13 +444,11 @@ fn walk_image_refs(
                     &rel_path,
                     all_images,
                     root_image_names,
-                    ref_names_seen,
                     live_objects,
                     parsed_erofs_ids,
                 )?;
             }
             FileType::Symlink => {
-                ref_names_seen.insert(rel_path.clone());
                 let target = readlinkat(dirfd, filename, [])
                     .with_context(|| format!("reading symlink images/refs/{rel_path}"))?;
                 let target_path = Path::new(OsStr::from_bytes(target.as_bytes()));
@@ -569,16 +462,6 @@ fn walk_image_refs(
                     }
                 }
 
-                if let Some(id) = &resolved_id {
-                    live_objects.insert(id.clone());
-                }
-
-                if let Some(id) = &resolved_id {
-                    if parsed_erofs_ids.contains(id) {
-                        continue;
-                    }
-                }
-
                 match openat(
                     dirfd,
                     filename,
@@ -586,6 +469,12 @@ fn walk_image_refs(
                     Mode::empty(),
                 ) {
                     Ok(fd) => {
+                        if let Some(id) = &resolved_id {
+                            live_objects.insert(id.clone());
+                            if parsed_erofs_ids.contains(id) {
+                                continue;
+                            }
+                        }
                         let data = read_fd_bytes(fd)?;
                         collect_erofs_bytes(&data, live_objects)
                             .with_context(|| format!("parsing EROFS image images/refs/{rel_path}"))?;
@@ -606,7 +495,6 @@ fn walk_image_refs(
                 if is_sidecar_bytes(filename.to_bytes()) {
                     continue;
                 }
-                ref_names_seen.insert(rel_path.clone());
                 let fd = openat(
                     dirfd,
                     filename,
@@ -629,7 +517,6 @@ fn walk_stream_refs(
     rel_prefix: &str,
     all_streams: &HashMap<String, Sha256HashValue>,
     root_stream_names: &mut HashSet<String>,
-    matched_stream_refs: &mut HashSet<String>,
     live_objects: &mut HashSet<Sha256HashValue>,
 ) -> Result<()> {
     for item in Dir::read_from(dirfd).context("reading streams/refs directory")? {
@@ -661,12 +548,10 @@ fn walk_stream_refs(
                     &rel_path,
                     all_streams,
                     root_stream_names,
-                    matched_stream_refs,
                     live_objects,
                 )?;
             }
             FileType::Symlink => {
-                matched_stream_refs.insert(rel_path.clone());
                 let target = readlinkat(dirfd, filename, [])
                     .with_context(|| format!("reading symlink streams/refs/{rel_path}"))?;
                 if let Ok(id) = Sha256HashValue::from_object_pathname(target.as_bytes()) {
@@ -737,8 +622,9 @@ fn walk_stream(
         } else if image_ids.contains(&ref_id) && !parsed_erofs_ids.contains(&ref_id) {
             if let Some(img_fd) = open_object_optional(objects_fd, &ref_id)? {
                 let data = read_fd_bytes(img_fd)?;
-                collect_erofs_bytes(&data, live_objects)
-                    .with_context(|| format!("collecting objects for stream-linked image {ref_id:?}"))?;
+                collect_erofs_bytes(&data, live_objects).with_context(|| {
+                    format!("collecting objects for stream-linked image {ref_id:?}")
+                })?;
                 parsed_erofs_ids.insert(ref_id);
             }
         }
@@ -750,6 +636,7 @@ fn walk_stream(
 fn cleanup_category(
     repo_fd: &OwnedFd,
     category: &str,
+    live_objects: &HashSet<Sha256HashValue>,
     removed_objects: &HashSet<Sha256HashValue>,
     dry_run: bool,
 ) -> Result<u64> {
@@ -761,6 +648,7 @@ fn cleanup_category(
     let mut count = cleanup_dir_links(
         &category_fd,
         false,
+        live_objects,
         removed_objects,
         &mut pruned_first_level_names,
         None,
@@ -773,6 +661,7 @@ fn cleanup_category(
         count += cleanup_dir_links(
             &refs_fd,
             true,
+            live_objects,
             removed_objects,
             &mut dummy,
             Some(&pruned_first_level_names),
@@ -787,6 +676,7 @@ fn cleanup_category(
 fn cleanup_dir_links(
     dirfd: &OwnedFd,
     recursive: bool,
+    live_objects: &HashSet<Sha256HashValue>,
     removed_objects: &HashSet<Sha256HashValue>,
     pruned_names: &mut HashSet<OsString>,
     first_level_pruned: Option<&HashSet<OsString>>,
@@ -815,6 +705,7 @@ fn cleanup_dir_links(
                 count += cleanup_dir_links(
                     &subfd,
                     recursive,
+                    live_objects,
                     removed_objects,
                     pruned_names,
                     first_level_pruned,
@@ -830,15 +721,23 @@ fn cleanup_dir_links(
                     }
                 };
 
-                let would_break = if is_broken {
+                let target = readlinkat(dirfd, filename, [])
+                    .with_context(|| format!("reading symlink {filename:?}"))?;
+                let target_id = Sha256HashValue::from_object_pathname(target.as_bytes()).ok();
+
+                let unanchored_first_level = !recursive
+                    && target_id
+                        .as_ref()
+                        .map(|id| !live_objects.contains(id))
+                        .unwrap_or(false);
+
+                let would_break = if is_broken || unanchored_first_level {
                     true
                 } else if dry_run {
-                    let target = readlinkat(dirfd, filename, [])
-                        .with_context(|| format!("reading symlink {filename:?}"))?;
-                    let points_to_removed_obj =
-                        Sha256HashValue::from_object_pathname(target.as_bytes())
-                            .map(|id| removed_objects.contains(&id))
-                            .unwrap_or(false);
+                    let points_to_removed_obj = target_id
+                        .as_ref()
+                        .map(|id| removed_objects.contains(id))
+                        .unwrap_or(false);
                     let points_to_pruned_entry = first_level_pruned
                         .and_then(|set| {
                             Path::new(OsStr::from_bytes(target.as_bytes()))

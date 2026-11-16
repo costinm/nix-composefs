@@ -1,4 +1,4 @@
-//! Tests for hardlink- and EROFS-anchor-aware garbage collection.
+//! Tests for hardlink-checkout- and EROFS-anchor-aware garbage collection.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -84,6 +84,8 @@ fn gc_keeps_referenced_and_removes_unreferenced_single_link_objects() {
     )
     .unwrap();
 
+    assert!(!cas.join("meta.json").exists());
+
     let id_a = image_object_id(&cas, "image-a");
     let id_b = image_object_id(&cas, "image-b");
     let objs_a = image_backing_objects(&cas.join("images/refs/image-a"));
@@ -98,7 +100,6 @@ fn gc_keeps_referenced_and_removes_unreferenced_single_link_objects() {
 
     let dry = gc(&GcOptions {
         cas: cas.clone(),
-        roots: vec![],
         dry_run: true,
     })
     .unwrap();
@@ -111,7 +112,6 @@ fn gc_keeps_referenced_and_removes_unreferenced_single_link_objects() {
 
     let real = gc(&GcOptions {
         cas: cas.clone(),
-        roots: vec![],
         dry_run: false,
     })
     .unwrap();
@@ -124,7 +124,7 @@ fn gc_keeps_referenced_and_removes_unreferenced_single_link_objects() {
 }
 
 #[test]
-fn gc_preserves_hardlinked_objects_until_external_link_removed() {
+fn gc_preserves_hardlinked_checked_out_files_until_unlinked() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let store = root.join("store");
@@ -153,31 +153,31 @@ fn gc_preserves_hardlinked_objects_until_external_link_removed() {
     backing.sort();
     assert_eq!(backing.len(), 2);
 
-    // Unanchor the EROFS image ref, and extract one backing object via hardlink.
+    // Unanchor the EROFS image ref, and check out one backing object via hardlink.
     std::fs::remove_file(cas.join("images/refs/system.composefs")).unwrap();
-    let extracted_dir = root.join("extracted");
+    let extracted_dir = root.join("checkout");
     std::fs::create_dir_all(&extracted_dir).unwrap();
     let extracted_file = extracted_dir.join("app");
     std::fs::hard_link(&backing[0], &extracted_file).unwrap();
 
     let first = gc(&GcOptions {
         cas: cas.clone(),
-        roots: vec![],
         dry_run: false,
     })
     .unwrap();
     assert_eq!(first.objects_hardlinked_kept, 1);
     assert_eq!(first.hardlinked_bytes, 4096);
     assert_eq!(first.objects_removed, 2);
-    assert!(backing[0].exists(), "hardlinked object must survive GC");
+    assert_eq!(first.images_pruned, 1);
+    assert!(backing[0].exists(), "checked-out hardlinked object must survive GC");
     assert!(!backing[1].exists(), "unlinked object must be removed");
     assert!(!object_path(&cas, &image_id).exists());
+    assert!(!cas.join("images").join(image_id.to_hex()).exists());
 
     // Dropping the external hardlink lets GC collect the object.
     std::fs::remove_file(&extracted_file).unwrap();
     let second = gc(&GcOptions {
         cas: cas.clone(),
-        roots: vec![],
         dry_run: false,
     })
     .unwrap();
@@ -187,64 +187,7 @@ fn gc_preserves_hardlinked_objects_until_external_link_removed() {
 }
 
 #[test]
-fn gc_preserves_closure_of_hardlinked_erofs_image() {
-    let td = tempfile::tempdir().unwrap();
-    let root = td.path();
-    let store = root.join("store");
-    let cas = root.join("cas");
-
-    let entry = "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-slot";
-    write(&store.join(entry).join("bin/one"), &[0x55; 4096]);
-    write(&store.join(entry).join("bin/two"), &[0x66; 4096]);
-
-    build(
-        &[StorePath::parse(entry).unwrap()],
-        &BuildOptions {
-            store,
-            cas: cas.clone(),
-            image: "system.composefs".into(),
-            threads: 1,
-        },
-    )
-    .unwrap();
-
-    let image_id = image_object_id(&cas, "system.composefs");
-    let erofs_obj = object_path(&cas, &image_id);
-
-    // Hardlink the EROFS image object itself into an active slot dir, then drop images/refs/.
-    let slot_dir = root.join("slot-101");
-    std::fs::create_dir_all(&slot_dir).unwrap();
-    let slot_image = slot_dir.join("system.composefs");
-    std::fs::hard_link(&erofs_obj, &slot_image).unwrap();
-    std::fs::remove_file(cas.join("images/refs/system.composefs")).unwrap();
-
-    // Backing file objects still have nlink == 1, yet must stay alive because
-    // the hardlinked EROFS image in images/ acts as an anchor.
-    let first = gc(&GcOptions {
-        cas: cas.clone(),
-        roots: vec![],
-        dry_run: false,
-    })
-    .unwrap();
-    assert_eq!(first.objects_reachable, 3);
-    assert_eq!(first.objects_removed, 0);
-    assert_eq!(list_object_files(&cas).len(), 3);
-
-    // Removing the slot hardlink drops the anchor.
-    std::fs::remove_file(&slot_image).unwrap();
-    let second = gc(&GcOptions {
-        cas: cas.clone(),
-        roots: vec![],
-        dry_run: false,
-    })
-    .unwrap();
-    assert_eq!(second.objects_removed, 3);
-    assert_eq!(second.images_pruned, 1);
-    assert!(list_object_files(&cas).is_empty());
-}
-
-#[test]
-fn gc_supports_external_erofs_anchor_and_tolerates_sig_sidecars() {
+fn gc_tolerates_sig_sidecars_and_optional_meta_json() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let store = root.join("store");
@@ -277,40 +220,43 @@ fn gc_supports_external_erofs_anchor_and_tolerates_sig_sidecars() {
     )
     .unwrap();
 
-    let id_a = image_object_id(&cas, "fw.composefs");
-    let id_b = image_object_id(&cas, "old.composefs");
-    let backing_a = image_backing_objects(&cas.join("images/refs/fw.composefs"));
-    assert_eq!(backing_a.len(), 1);
-    let obj_a = backing_a.into_iter().next().unwrap();
-
-    // Copy fw.composefs externally (no hardlink), remove in-repo image symlinks,
-    // and leave sign.sh-style sidecars inside images/refs/.
-    let external_dir = root.join("external");
-    std::fs::create_dir_all(&external_dir).unwrap();
-    let external_anchor = external_dir.join("fw.composefs");
-    std::fs::copy(cas.join("images/refs/fw.composefs"), &external_anchor).unwrap();
-
-    std::fs::remove_file(cas.join("images/refs/fw.composefs")).unwrap();
-    std::fs::remove_file(cas.join("images/refs/old.composefs")).unwrap();
-    std::fs::remove_file(cas.join("images").join(id_a.to_hex())).unwrap();
-    std::fs::remove_file(cas.join("images").join(id_b.to_hex())).unwrap();
-
     let sig_file = cas.join("images/refs/fw.composefs.sig");
     let db_sig_file = cas.join("images/refs/fw.composefs.1234abcd.db.sig");
     std::fs::write(&sig_file, b"sig").unwrap();
     std::fs::write(&db_sig_file, b"dbsig").unwrap();
 
-    let report = gc(&GcOptions {
+    // Works without meta.json and keeps anchored fw.composefs + sidecars.
+    std::fs::remove_file(cas.join("images/refs/old.composefs")).unwrap();
+    let first = gc(&GcOptions {
         cas: cas.clone(),
-        roots: vec![external_anchor.to_string_lossy().into_owned()],
         dry_run: false,
     })
     .unwrap();
-
-    assert_eq!(report.objects_reachable, 1);
-    assert_eq!(report.objects_removed, 3);
-    assert!(object_path(&cas, &obj_a).exists());
-    assert_eq!(list_object_files(&cas).len(), 1);
+    assert_eq!(first.objects_reachable, 2);
+    assert_eq!(first.objects_removed, 2);
+    assert_eq!(first.images_pruned, 1);
     assert!(sig_file.exists());
     assert!(db_sig_file.exists());
+
+    // Also works when a compatible meta.json is present (even without v1_erofs / fs-verity).
+    std::fs::write(
+        cas.join("meta.json"),
+        r#"{"version":1,"algorithm":"fsverity-sha256-12"}"#,
+    )
+    .unwrap();
+    let second = gc(&GcOptions {
+        cas: cas.clone(),
+        dry_run: true,
+    })
+    .unwrap();
+    assert_eq!(second.objects_reachable, 2);
+    assert_eq!(second.objects_removed, 0);
+
+    // Rejects incompatible algorithm in meta.json.
+    std::fs::write(
+        cas.join("meta.json"),
+        r#"{"version":1,"algorithm":"fsverity-sha512-12"}"#,
+    )
+    .unwrap();
+    assert!(gc(&GcOptions { cas, dry_run: true }).is_err());
 }
